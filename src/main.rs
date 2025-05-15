@@ -30,7 +30,7 @@ enum ProxyError {
     Parse(Box<dyn Error + Send + Sync>),
     BufferFull,
     ClientDisconnected,
-    HttpErrorSent, 
+    HttpErrorSent,
 }
 
 impl fmt::Display for ProxyError {
@@ -75,79 +75,100 @@ struct ProxyConnection {
 
 impl ProxyConnection {
     fn new(client_socket: TcpStream, client_addr: std::net::SocketAddr) -> Self {
-        Self {
-            client_socket,
-            client_addr,
-            client_buffer: BytesMut::with_capacity(4096),
-        }
-    }
-
-    async fn send_http_error(&mut self, status_code: u16, message: &str) -> Result<(), io::Error> {
-        let response_body = format!("<h1>{} {}</h1>", status_code, message);
-        let response = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            status_code, message, response_body.len(), response_body
-        );
-        self.client_socket.write_all(response.as_bytes()).await?;
-        self.client_socket.shutdown().await?; 
-        Ok(())
+        Self { client_socket, client_addr, client_buffer: BytesMut::with_capacity(4096) }
     }
 
     async fn read_and_parse_request(&mut self) -> Result<http_parser::ParsedRequest, ProxyError> {
         loop {
             match http_parser::parse_http_request(&mut self.client_buffer) {
                 Ok(Some(parsed_req)) => {
-                    println!("Parsed request from {}: {:?}", self.client_addr, parsed_req);
+                    println!("Parsed request from {}: {:#?}", self.client_addr, parsed_req);
                     return Ok(parsed_req);
                 }
-                Ok(None) => { // Partial request
+                Ok(None) => {
                     if self.client_buffer.len() == self.client_buffer.capacity() {
-                        eprintln!("Request buffer full for client {}, but request still incomplete.", self.client_addr);
-                        self.send_http_error(413, "Payload Too Large").await.map_err(|e| eprintln!("Error sending 413: {}", e)).ok();
+                        eprintln!(
+                            "Request buffer full for client {}, but request still incomplete.",
+                            self.client_addr
+                        );
+                        self.send_http_error(413, "Payload Too Large")
+                            .await
+                            .map_err(|e| eprintln!("Error sending 413: {}", e))
+                            .ok();
                         return Err(ProxyError::HttpErrorSent);
                     }
 
                     match self.client_socket.read_buf(&mut self.client_buffer).await {
                         Ok(0) => {
                             if self.client_buffer.is_empty() {
-                                println!("Client {} disconnected before sending any data.", self.client_addr);
+                                println!(
+                                    "Client {} disconnected before sending any data.",
+                                    self.client_addr
+                                );
                             } else {
-                                println!("Client {} disconnected before sending a complete request.", self.client_addr);
+                                println!(
+                                    "Client {} disconnected before sending a complete request.",
+                                    self.client_addr
+                                );
                             }
                             return Err(ProxyError::ClientDisconnected);
                         }
                         Ok(n) => {
-                            println!("Read an additional {} bytes from {} (total buffer: {})", n, self.client_addr, self.client_buffer.len());
+                            println!(
+                                "Read an additional {} bytes from {} (total buffer: {})",
+                                n,
+                                self.client_addr,
+                                self.client_buffer.len()
+                            );
                         }
                         Err(e) => return Err(ProxyError::Io(e)),
                     }
                 }
                 Err(e) => {
                     eprintln!("Error parsing HTTP request from {}: {}", self.client_addr, e);
-                    self.send_http_error(400, "Bad Request").await.map_err(|e| eprintln!("Error sending 400: {}", e)).ok();
+                    self.send_http_error(400, "Bad Request")
+                        .await
+                        .map_err(|e| eprintln!("Error sending 400: {}", e))
+                        .ok();
                     return Err(ProxyError::HttpErrorSent);
                 }
             }
         }
     }
 
-    async fn connect_to_upstream(&mut self, _req: &http_parser::ParsedRequest) -> Result<TcpStream, ProxyError> {
+    async fn connect_to_upstream(
+        &mut self,
+        _req: &http_parser::ParsedRequest,
+    ) -> Result<TcpStream, ProxyError> {
         let upstream_addr = "192.168.0.40:80";
-        println!("Connecting to upstream server: {} for client {}", upstream_addr, self.client_addr);
+        println!(
+            "Connecting to upstream server: {} for client {}",
+            upstream_addr, self.client_addr
+        );
         match TcpStream::connect(upstream_addr).await {
             Ok(socket) => {
                 println!("Connected to upstream for client {}", self.client_addr);
                 Ok(socket)
             }
             Err(e) => {
-                eprintln!("Failed to connect to upstream server {} for client {}: {}", upstream_addr, self.client_addr, e);
-                self.send_http_error(502, "Bad Gateway").await.map_err(|e| eprintln!("Error sending 502: {}", e)).ok();
+                eprintln!(
+                    "Failed to connect to upstream server {} for client {}: {}",
+                    upstream_addr, self.client_addr, e
+                );
+                self.send_http_error(502, "Bad Gateway")
+                    .await
+                    .map_err(|e| eprintln!("Error sending 502: {}", e))
+                    .ok();
                 Err(ProxyError::HttpErrorSent)
             }
         }
     }
 
-    async fn forward_request_to_upstream(&mut self, upstream_socket: &mut TcpStream, req: &http_parser::ParsedRequest) -> Result<(), ProxyError> {
+    async fn forward_request_to_upstream(
+        &mut self,
+        upstream_socket: &mut TcpStream,
+        req: &http_parser::ParsedRequest,
+    ) -> Result<(), ProxyError> {
         let request_line = format!("{} {} HTTP/1.{}\r\n", req.method, req.path, req.version);
         upstream_socket.write_all(request_line.as_bytes()).await?;
 
@@ -155,16 +176,37 @@ impl ProxyConnection {
             let header_line = format!("{}: {}\r\n", name, value);
             upstream_socket.write_all(header_line.as_bytes()).await?;
         }
-        upstream_socket.write_all(b"\r\n").await?; // End of headers
+        upstream_socket.write_all(b"\r\n").await?; 
 
-        if !self.client_buffer.is_empty() { // Send remaining body from initial parse buffer
-            println!("Writing {} bytes of initial body from client_buffer to upstream for {}", self.client_buffer.len(), self.client_addr);
+        if !self.client_buffer.is_empty() {
+            println!(
+                "Writing {} bytes of initial body from client_buffer to upstream for {}",
+                self.client_buffer.len(),
+                self.client_addr
+            );
             upstream_socket.write_all(&self.client_buffer).await?;
         }
         Ok(())
     }
 
-    async fn proxy_bidirectional_data(&mut self, upstream_socket: &mut TcpStream) -> Result<(), ProxyError> {
+    async fn send_http_error(&mut self, status_code: u16, message: &str) -> Result<(), io::Error> {
+        let response_body = format!("<h1>{} {}</h1>", status_code, message);
+        let response = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status_code,
+            message,
+            response_body.len(),
+            response_body
+        );
+        self.client_socket.write_all(response.as_bytes()).await?;
+        self.client_socket.shutdown().await?;
+        Ok(())
+    }
+
+    async fn proxy_bidirectional_data(
+        &mut self,
+        upstream_socket: &mut TcpStream,
+    ) -> Result<(), ProxyError> {
         let (mut client_read, mut client_write) = self.client_socket.split();
         let (mut upstream_read, mut upstream_write) = upstream_socket.split();
 
@@ -189,18 +231,22 @@ impl ProxyConnection {
 
     pub async fn handle_request(&mut self) -> Result<(), ProxyError> {
         let req = self.read_and_parse_request().await?;
-        
+
         let mut upstream_socket = self.connect_to_upstream(&req).await?;
-        
+
         match self.forward_request_to_upstream(&mut upstream_socket, &req).await {
-            Ok(_) => {
-            }
-            Err(forward_err) => { 
-                eprintln!("Error forwarding request to upstream for {}: {}", self.client_addr, forward_err);
-                if let Err(e) = self.send_http_error(502, "Bad Gateway (Upstream Write Error)").await {
+            Ok(_) => {}
+            Err(forward_err) => {
+                eprintln!(
+                    "Error forwarding request to upstream for {}: {}",
+                    self.client_addr, forward_err
+                );
+                if let Err(e) =
+                    self.send_http_error(502, "Bad Gateway (Upstream Write Error)").await
+                {
                     eprintln!("Error sending 502 to client {}: {}", self.client_addr, e);
                 }
-                return Err(ProxyError::HttpErrorSent); 
+                return Err(ProxyError::HttpErrorSent);
             }
         }
 
