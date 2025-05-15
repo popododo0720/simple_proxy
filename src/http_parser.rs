@@ -29,6 +29,7 @@ pub fn parse_http_request(buffer: &mut BytesMut) -> Result<Option<ParsedRequest>
                 .map(|h| (h.name.to_string(), String::from_utf8_lossy(h.value).into_owned()))
                 .collect(),
         };
+        buffer.advance(parsed_len);
         Ok(Some(parsed_req))
     } else {
         Ok(None)
